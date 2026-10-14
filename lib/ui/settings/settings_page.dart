@@ -883,6 +883,13 @@ class _Ytm extends ConsumerWidget {
                 const Expanded(
                   child: Text('Not connected', style: WaveType.trackTitle),
                 ),
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: Button(
+                    onPressed: () => _ytPasteCookies(context, ref),
+                    child: const Text('Paste cookies'),
+                  ),
+                ),
                 FilledButton(
                   onPressed: () => _ytConnect(context, ref),
                   child: const Text('Connect'),
@@ -975,8 +982,9 @@ class _Ytm extends ConsumerWidget {
   /// runs the shared roster upsert + chooser tail.
   Future<void> _ytConnect(BuildContext context, WidgetRef ref) async {
     var cancelled = false;
-    // Non-blocking wait dialog — Cancel just stops listening; the
-    // user closes the browser window via the native guard (hide).
+    var pasteRequested = false;
+    // Non-blocking wait dialog — Cancel stops the flow (the poller
+    // exits and the browser window is hidden, never destroyed).
     // NOTE: popped via the dialog's OWN context. A rootNavigator pop
     // here would eat the settings page under the go_router ShellRoute.
     BuildContext? waitDialogContext;
@@ -1012,6 +1020,7 @@ class _Ytm extends ConsumerWidget {
                   'Google window and use your password instead.',
                   style: TextStyle(fontSize: 12),
                 ),
+                _YtBlockedHint(),
               ],
             ),
             actions: [
@@ -1024,6 +1033,16 @@ class _Ytm extends ConsumerWidget {
               Button(
                 onPressed: () {
                   cancelled = true;
+                  pasteRequested = true;
+                  unawaited(YtWebLogin.cancel());
+                  Navigator.of(dialogContext).pop();
+                },
+                child: const Text('Paste cookies'),
+              ),
+              Button(
+                onPressed: () {
+                  cancelled = true;
+                  unawaited(YtWebLogin.cancel());
                   Navigator.of(dialogContext).pop();
                 },
                 child: const Text('Cancel'),
@@ -1052,20 +1071,36 @@ class _Ytm extends ConsumerWidget {
     if (waitCtx != null && waitCtx.mounted) {
       Navigator.of(waitCtx).maybePop();
     }
+    if (pasteRequested) {
+      if (context.mounted) await _ytPasteCookies(context, ref);
+      return;
+    }
     if (cancelled || header == null || header.isEmpty) {
       if (!cancelled && context.mounted) {
-        await showDialog(
+        final wasBlocked = YtWebLogin.blockedByGoogle.value;
+        final paste = await showDialog<bool>(
           context: context,
           builder: (dialogContext) => ContentDialog(
             title: const Text('Sign-in incomplete'),
-            content: const Text(
-              'No session was captured. Please try again — if Google '
-              'shows a passkey step that stalls after Windows Hello, '
-              'reload the browser window or pick "Try another way" '
-              'and sign in with your password instead. Make sure you '
-              'complete the sign-in fully before closing the window.',
+            content: Text(
+              wasBlocked
+                  ? 'Google refused to sign in from the built-in '
+                      'browser window ("This browser or app may not be '
+                      'secure"). You can still connect by pasting your '
+                      'YouTube Music cookies from your regular browser.'
+                  : 'No session was captured. Please try again — if Google '
+                      'shows a passkey step that stalls after Windows Hello, '
+                      'reload the browser window or pick "Try another way" '
+                      'and sign in with your password instead. Make sure you '
+                      'complete the sign-in fully before closing the window. '
+                      'If Google keeps refusing the sign-in, paste your '
+                      'cookies instead.',
             ),
             actions: [
+              Button(
+                onPressed: () => Navigator.of(dialogContext).pop(true),
+                child: const Text('Paste cookies'),
+              ),
               FilledButton(
                 onPressed: () => Navigator.of(dialogContext).pop(),
                 child: const Text('OK'),
@@ -1073,6 +1108,9 @@ class _Ytm extends ConsumerWidget {
             ],
           ),
         );
+        if (paste == true && context.mounted) {
+          await _ytPasteCookies(context, ref);
+        }
       }
       return;
     }
@@ -1206,6 +1244,7 @@ class _CardActions extends ConsumerWidget {
   /// same window, never destroyed), then the shared capture tail.
   static Future<void> _ytAddAccount(BuildContext context, WidgetRef ref) async {
     var cancelled = false;
+    var pasteRequested = false;
     BuildContext? waitCtx;
     unawaited(
       showDialog(
@@ -1239,6 +1278,7 @@ class _CardActions extends ConsumerWidget {
                   'Google window and use your password instead.',
                   style: TextStyle(fontSize: 12),
                 ),
+                _YtBlockedHint(),
               ],
             ),
             actions: [
@@ -1251,6 +1291,16 @@ class _CardActions extends ConsumerWidget {
               Button(
                 onPressed: () {
                   cancelled = true;
+                  pasteRequested = true;
+                  unawaited(YtWebLogin.cancel());
+                  Navigator.of(dialogContext).pop();
+                },
+                child: const Text('Paste cookies'),
+              ),
+              Button(
+                onPressed: () {
+                  cancelled = true;
+                  unawaited(YtWebLogin.cancel());
                   Navigator.of(dialogContext).pop();
                 },
                 child: const Text('Cancel'),
@@ -1270,11 +1320,19 @@ class _CardActions extends ConsumerWidget {
     if (wc != null && wc.mounted) {
       Navigator.of(wc).maybePop();
     }
+    if (pasteRequested) {
+      if (context.mounted) await _ytPasteCookies(context, ref);
+      return;
+    }
     if (cancelled || header == null || header.isEmpty) {
       if (!cancelled && context.mounted) {
         await _showYtFail(
           context,
-          'No session was captured. Please try again.',
+          YtWebLogin.blockedByGoogle.value
+              ? 'Google refused to sign in from the built-in browser '
+                  'window. Use "Paste cookies" to add this account '
+                  'from your regular browser instead.'
+              : 'No session was captured. Please try again.',
         );
       }
       return;
@@ -1333,6 +1391,7 @@ class _CardActions extends ConsumerWidget {
               Button(
                 onPressed: () {
                   cancelled = true;
+                  unawaited(YtWebLogin.cancel());
                   Navigator.of(dialogContext).pop();
                 },
                 child: const Text('Cancel'),
@@ -1536,6 +1595,117 @@ Future<void> _refocusMain() async {
     await windowManager.focus();
   } catch (_) {}
 }
+
+/// Fallback cookie import: lets users paste their Cookie header or
+/// exported cookies.txt/JSON from a standard browser if Google blocks
+/// the embedded WebView sign-in.
+Future<void> _ytPasteCookies(BuildContext context, WidgetRef ref) async {
+  final controller = TextEditingController();
+  String? errorText;
+
+  final captured = await showDialog<String>(
+    context: context,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setState) {
+        return ContentDialog(
+          title: const Text('Import YouTube Music Cookies'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'If Google blocks embedded browser sign-in, you can paste cookies directly from your browser:\n\n'
+                '1. Sign in to music.youtube.com in your regular browser (Chrome, Edge, Safari, Firefox).\n'
+                '2. Open Developer Tools (F12 or Inspect) → Network tab (or use an extension like "Cookie-Editor").\n'
+                '3. Copy the Cookie header string, JSON array, or Netscape cookies.txt.\n'
+                '4. Paste the content below (must include SAPISID or __Secure-3PAPISID, and LOGIN_INFO):',
+                style: TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              TextBox(
+                controller: controller,
+                maxLines: 6,
+                placeholder: 'Paste Cookie header, Netscape cookies.txt, or JSON array here...',
+                onChanged: (_) {
+                  if (errorText != null) setState(() => errorText = null);
+                },
+              ),
+              if (errorText != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  errorText!,
+                  style: WaveType.meta.copyWith(color: Colors.red),
+                ),
+              ],
+            ],
+          ),
+          actions: [
+            Button(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final text = controller.text.trim();
+                if (text.isEmpty) {
+                  setState(() => errorText = 'Please paste cookies first.');
+                  return;
+                }
+                try {
+                  final normalized = InnerTubeMusicApi.normalizeCookies(text);
+                  Navigator.of(dialogContext).pop(normalized);
+                } catch (e) {
+                  setState(() => errorText = '$e');
+                }
+              },
+              child: const Text('Connect'),
+            ),
+          ],
+        );
+      },
+    ),
+  );
+
+  controller.dispose();
+
+  if (captured == null || captured.isEmpty || !context.mounted) return;
+
+  await _ytConnectCaptured(
+    context,
+    ref,
+    header: captured,
+    pageId: '',
+  );
+  await _refocusMain();
+}
+
+/// Warning banner displayed inside the sign-in wait dialog when
+/// Google serves the "This browser or app may not be secure" rejection.
+class _YtBlockedHint extends StatelessWidget {
+  const _YtBlockedHint();
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: YtWebLogin.blockedByGoogle,
+      builder: (context, blocked, _) {
+        if (!blocked) return const SizedBox.shrink();
+        return const Padding(
+          padding: EdgeInsets.only(top: 10),
+          child: InfoBar(
+            title: Text('Sign-in blocked by Google'),
+            content: Text(
+              'Google detected an embedded browser ("This browser or app may not be secure"). '
+              'Click "Paste cookies" to sign in using cookies from your regular browser instead.',
+            ),
+            severity: InfoBarSeverity.warning,
+          ),
+        );
+      },
+    );
+  }
+}
+
 
 /// Addon sources: personal addon URLs replace the built-in lossless
 /// backend as the lossless tier (see [AddonApi]). Quota meters fill

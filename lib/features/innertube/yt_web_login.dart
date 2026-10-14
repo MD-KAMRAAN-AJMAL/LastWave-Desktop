@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:desktop_webview_window/desktop_webview_window.dart';
 import 'package:flutter/foundation.dart';
 
+import 'yt_login_identity.dart';
 import 'yt_webview_guard.dart';
 
 /// In-app YouTube Music sign-in via a visible system WebView.
@@ -45,6 +47,36 @@ class YtWebLogin {
     } finally {
       _inflight = false;
     }
+  }
+
+  /// Bumped by [cancel]; every poll loop captures it on entry and
+  /// exits as soon as it changes. Without this, a cancelled dialog
+  /// left the poller (and the single-flight lock) alive until timeout.
+  static int _flowGeneration = 0;
+
+  /// Stop any in-flight login wait and hide the window (never
+  /// destroyed). The awaiting flow then returns `null`.
+  static Future<void> cancel() async {
+    _flowGeneration++;
+    await hideWindow();
+  }
+
+  /// True while the sign-in window shows Google's "Couldn't sign you
+  /// in — This browser or app may not be secure" rejection. The wait
+  /// dialogs listen to it and point the user at the manual cookie
+  /// paste. Reset at the start of every flow.
+  static final ValueNotifier<bool> blockedByGoogle = ValueNotifier(false);
+
+  /// Pure matcher for Google's embedded-browser rejection. [probe] is
+  /// the page URL, a newline, then the page text. The URL check is
+  /// locale-independent (`/signin/rejected`); the text check covers
+  /// the English copy. Unit-tested.
+  static bool isGoogleBlockedPage(String probe) {
+    final t = probe.toLowerCase();
+    if (t.contains('accounts.google.com') && t.contains('/signin/rejected')) {
+      return true;
+    }
+    return t.contains('browser or app may not be secure');
   }
 
   /// The cached window for out-of-flow uses (brand-channel watching).
@@ -170,40 +202,76 @@ class YtWebLogin {
     return t.contains('verifying') && t.contains('passkey');
   }
 
-  /// Best-effort read of the current page text. False on any failure
-  /// (non-YouTube pages, JS errors, closed window).
-  static Future<bool> _isStuckOnPasskeyPage(Webview webview) async {
+  /// Best-effort read of the current page URL + text, as
+  /// `"<href>\n<text>"` (text capped at 2000 chars). Empty on any
+  /// failure (JS errors, closed window).
+  static Future<String> _readPageProbe(Webview webview) async {
     try {
       final raw = await webview
           .evaluateJavaScript(
-              'document.body ? document.body.innerText.slice(0, 2000) : ""')
+              'String(location.href) + "\\n" + '
+              '(document.body ? document.body.innerText.slice(0, 2000) : "")')
           .timeout(const Duration(seconds: 8));
-      var v = (raw ?? '').trim();
-      // evaluateJavaScript returns JSON-encoded strings; strip the
-      // surrounding quotes (escapes don't matter for matching).
-      if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) {
-        v = v.substring(1, v.length - 1);
-      }
-      if (v.isEmpty) return false;
-      return isPasskeyVerificationStall(v);
+      return _decodeJsString(raw);
     } catch (_) {
-      return false;
+      return '';
     }
+  }
+
+  /// evaluateJavaScript returns JSON-encoded strings (native JSON
+  /// writers may also escape `/` as `\/`). Decode properly, falling
+  /// back to stripping the surrounding quotes.
+  static String _decodeJsString(String? raw) {
+    var v = (raw ?? '').trim();
+    if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) {
+      try {
+        final decoded = jsonDecode(v);
+        if (decoded is String) return decoded;
+      } catch (_) {}
+      v = v.substring(1, v.length - 1);
+    }
+    return v;
   }
 
   /// Title must match kYtWindowTitle in linux/runner/yt_webview_guard.cc
   /// (ASCII-only: compared byte-wise in native code).
   static const _windowTitle = 'LastWave YouTube Sign In';
 
-  /// Appended to the system WebView's default UA before the first
-  /// navigation. On macOS the plugin hosts a WKWebView whose default
-  /// Safari UA (no `Chrome/` token) makes music.youtube.com render
-  /// "not optimized for your browser". The native call sets
-  /// `customUserAgent = defaultUA + suffix`, so the leading space
-  /// matters. Called once per window creation; the cached window
-  /// keeps it for reuse.
-  static const _macChromeSuffix =
-      ' Chrome/131.0.0.0 Safari/537.36';
+  /// Applies the engine-consistent browser identity (see
+  /// [YtLoginIdentity]) to a freshly created window, before its first
+  /// navigation. Called once per window creation; the cached window
+  /// keeps it for reuse. Best-effort: a failure leaves the default
+  /// WebView identity, and the manual cookie paste stays available.
+  ///
+  /// Replaces the old macOS `Chrome/131 Safari/537.36` suffix: a WebKit
+  /// engine claiming to be Chrome is exactly the mismatch Google's
+  /// sign-in rejects with "This browser or app may not be secure"
+  /// (issue #38).
+  static Future<void> _applyIdentity(Webview w) async {
+    final identity = YtLoginIdentity.forPlatform(
+      Platform.operatingSystem,
+      Platform.operatingSystemVersion,
+    );
+    final script = identity.documentStartScript;
+    if (script != null) {
+      try {
+        w.addScriptToExecuteOnDocumentCreated(script);
+      } catch (_) {}
+    }
+    final suffix = identity.uaSuffix;
+    if (suffix != null) {
+      try {
+        await w.setApplicationNameForUserAgent(suffix);
+      } catch (_) {}
+    }
+    final full = identity.fullUserAgent;
+    if (full != null && Platform.isLinux) {
+      final ok = await YtWebviewGuard.setUserAgent(full);
+      if (kDebugMode) {
+        debugPrint('YtWebLogin: full UA applied=$ok');
+      }
+    }
+  }
 
   static Future<Webview?> _ensureWindow() async {
     final cached = _cachedWindow;
@@ -239,11 +307,7 @@ class YtWebLogin {
         ),
       );
       _cachedWindow = w;
-      if (Platform.isMacOS) {
-        try {
-          await w.setApplicationNameForUserAgent(_macChromeSuffix);
-        } catch (_) {}
-      }
+      await _applyIdentity(w);
       // If the window ever really dies, drop the cache so the next
       // sign-in creates a fresh window instead of talking to a dead one.
       unawaited(w.onClose.then((_) {
@@ -274,6 +338,7 @@ class YtWebLogin {
   static const _logoutUrl = 'https://accounts.google.com/Logout';
 
   static Future<String?> signInFresh() async {
+    final generation = _flowGeneration;
     final w = await _ensureWindow();
     if (w == null) return null;
     try {
@@ -287,6 +352,8 @@ class YtWebLogin {
       // Let the logout round-trip land before the login page loads.
       await Future<void>.delayed(const Duration(seconds: 4));
     } catch (_) {}
+    // Cancelled during the logout wait: don't start the login.
+    if (generation != _flowGeneration) return null;
     return signIn();
   }
 
@@ -367,26 +434,37 @@ class YtWebLogin {
   /// JS). The session IS minted though — a reload lands signed-in —
   /// so when the stall text persists, the login page is reloaded
   /// in place (cookies survive) instead of polling forever.
+  ///
+  /// Also exits when [cancel] is called, and mirrors Google's
+  /// "This browser or app may not be secure" rejection into
+  /// [blockedByGoogle] so the wait dialog can offer the cookie paste.
   static Future<String?> _waitForLogin(Webview webview) async {
+    final generation = _flowGeneration;
+    bool cancelled() => generation != _flowGeneration;
+    blockedByGoogle.value = false;
     // Give the page a moment to load before the first read.
     await Future<void>.delayed(const Duration(seconds: 4));
     var closed = false;
     unawaited(webview.onClose.then((_) => closed = true));
     var stuckCycles = 0;
     var autoReloads = 0;
-    while (!closed) {
+    while (!closed && !cancelled()) {
       final header = await _readHeader(webview);
       if (header != null) return header;
-      if (closed) return null;
-      // Stall check runs sequentially after the cookie read (never
-      // overlapping it). ~5 consecutive hits ≈ 10s stuck.
-      var stuck = false;
-      try {
-        stuck = await _isStuckOnPasskeyPage(webview);
-      } catch (_) {
-        stuck = false;
+      if (closed || cancelled()) return null;
+      // Page checks run sequentially after the cookie read (never
+      // overlapping it). ~5 consecutive stall hits ≈ 10s stuck.
+      final probe = await _readPageProbe(webview);
+      if (closed || cancelled()) return null;
+      final blocked = probe.isNotEmpty && isGoogleBlockedPage(probe);
+      // A failed read (empty probe) keeps the last known state.
+      if (probe.isNotEmpty && blockedByGoogle.value != blocked) {
+        blockedByGoogle.value = blocked;
+        if (kDebugMode) {
+          debugPrint('YtWebLogin: blocked by Google=$blocked');
+        }
       }
-      if (closed) return null;
+      final stuck = probe.isNotEmpty && isPasskeyVerificationStall(probe);
       if (stuck) {
         stuckCycles++;
         if (stuckCycles >= 5 && autoReloads < 2) {

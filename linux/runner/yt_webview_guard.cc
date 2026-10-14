@@ -57,6 +57,48 @@ static void arm_delete_blocker(GtkWidget* window) {
                    nullptr);
 }
 
+// Depth-first search for the plugin's WebKitWebView inside `widget`.
+// Matched by GType name so the runner doesn't need to link webkit2gtk:
+// the plugin has already registered the type by the time a window
+// exists. Subclasses match too (g_type_is_a).
+static GtkWidget* find_webkit_view(GtkWidget* widget) {
+  if (widget == nullptr) {
+    return nullptr;
+  }
+  const GType webkit_type = g_type_from_name("WebKitWebView");
+  if (webkit_type != 0 && g_type_is_a(G_OBJECT_TYPE(widget), webkit_type)) {
+    return widget;
+  }
+  if (!GTK_IS_CONTAINER(widget)) {
+    return nullptr;
+  }
+  GList* children = gtk_container_get_children(GTK_CONTAINER(widget));
+  GtkWidget* found = nullptr;
+  for (GList* l = children; l != nullptr && found == nullptr; l = l->next) {
+    found = find_webkit_view(GTK_WIDGET(l->data));
+  }
+  g_list_free(children);
+  return found;
+}
+
+// Replace the sign-in WebView's whole UA through GObject properties
+// (WebKitWebView:settings -> WebKitSettings:user-agent). Returns false
+// when the window or view can't be found.
+static bool set_user_agent(GtkWidget* window, const gchar* user_agent) {
+  GtkWidget* view = find_webkit_view(window);
+  if (view == nullptr) {
+    return false;
+  }
+  GObject* settings = nullptr;
+  g_object_get(G_OBJECT(view), "settings", &settings, nullptr);
+  if (settings == nullptr) {
+    return false;
+  }
+  g_object_set(settings, "user-agent", user_agent, nullptr);
+  g_object_unref(settings);
+  return true;
+}
+
 static void handle_method_call(FlMethodChannel* /*channel*/,
                                FlMethodCall* method_call,
                                gpointer /*user_data*/) {
@@ -78,6 +120,23 @@ static void handle_method_call(FlMethodChannel* /*channel*/,
       gtk_window_present(GTK_WINDOW(window));
     }
     g_autoptr(FlValue) result = fl_value_new_bool(window != nullptr);
+    fl_method_call_respond_success(method_call, result, nullptr);
+    return;
+  }
+  // Full UA replacement for the sign-in window (issue #38). Argument:
+  // the UA string. Responds false when the window/view is missing or
+  // the argument isn't a non-empty string.
+  if (strcmp(method, "setUserAgent") == 0) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    bool ok = false;
+    if (window != nullptr && args != nullptr &&
+        fl_value_get_type(args) == FL_VALUE_TYPE_STRING) {
+      const gchar* ua = fl_value_get_string(args);
+      if (ua != nullptr && ua[0] != '\0') {
+        ok = set_user_agent(window, ua);
+      }
+    }
+    g_autoptr(FlValue) result = fl_value_new_bool(ok);
     fl_method_call_respond_success(method_call, result, nullptr);
     return;
   }

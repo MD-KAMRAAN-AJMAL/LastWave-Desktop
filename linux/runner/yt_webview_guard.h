@@ -12,6 +12,10 @@
 // close. So neither the YouTube sign-in window nor the BotGuard poToken
 // window is ever destroyed — this guard hides them instead, and converts
 // each window's own X button into a hide.
+//
+// It also exposes "setUserAgent" for the sign-in window: the plugin can
+// only append to WebKitGTK's default UA, but Google's sign-in needs a
+// full, engine-consistent UA (issue #38).
 void yt_webview_guard_register(FlView* view);
 
 #endif  // FLUTTER_YT_WEBVIEW_GUARD_H_

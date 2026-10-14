@@ -38,6 +38,19 @@ class YtWebviewGuard {
     }
   }
 
+  /// Replace the sign-in WebView's entire user agent (the plugin can
+  /// only append to WebKitGTK's default). False when unsupported, the
+  /// window is missing, or the native side rejected the value.
+  static Future<bool> setUserAgent(String userAgent) async {
+    if (!isSupported) return false;
+    try {
+      return await _channel.invokeMethod<bool>('setUserAgent', userAgent) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Hide the BotGuard poToken window (`LastWave BotGuard`). False when
   /// unsupported or not found. Called right after create (the plugin
   /// hide call is a no-op on Linux) and instead of `close()` — the
